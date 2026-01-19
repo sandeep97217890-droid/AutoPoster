@@ -1,2 +1,5 @@
 *.session
 autoposter
+config.yaml
+*.db
+*.dat
