@@ -25,6 +25,7 @@ type Config struct {
 }
 
 type Job struct {
+	ID       int
 	Chats    []int64
 	Message  *telegram.NewMessage
 	Interval time.Duration
@@ -37,9 +38,12 @@ var (
 	client *telegram.Client
 	mu     sync.Mutex
 	jobs   []*Job
+	jobID  = 1
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	if err := loadConfig("config.yaml"); err != nil {
 		log.Fatal(err)
 	}
@@ -68,7 +72,7 @@ func main() {
 	bot.On("cmd:cancel", cancelHandler, adminFilter)
 
 	botinfo, _ := bot.GetMe()
-	log.Printf("Bot logged in as: %s (@%s)", botinfo.FirstName, botinfo.Username)
+	log.Printf("BOT LOGGED IN → %s (@%s)", botinfo.FirstName, botinfo.Username)
 
 	client, err = telegram.NewClient(telegram.ClientConfig{
 		AppID:         int32(config.Telegram.AppID),
@@ -85,7 +89,7 @@ func main() {
 	}
 
 	me, _ := client.GetMe()
-	log.Printf("User logged in as: %s (@%s)", me.FirstName, me.Username)
+	log.Printf("USER LOGGED IN → %s (@%s)", me.FirstName, me.Username)
 
 	bot.Idle()
 }
@@ -116,12 +120,12 @@ func isAuthorized(userID int64) bool {
 }
 
 func startHandler(m *telegram.NewMessage) error {
-	msg := `🤖 <b>Welcome to AutoPoster</b>
+	msg := `🤖 <b>AutoPoster</b>
 
 Commands:
-/setup - Create a new job
-/status - View running jobs
-/cancel - Stop a job`
+/setup - Create job
+/status - Show jobs
+/cancel - Stop job`
 
 	m.Reply(msg, &telegram.SendOptions{ParseMode: "html"})
 	return nil
@@ -136,21 +140,14 @@ func statusHandler(m *telegram.NewMessage) error {
 		return nil
 	}
 
-	text := "📊 <b>Active Jobs</b>\n\n"
+	text := "📊 <b>Running Jobs</b>\n\n"
 
-	for i, job := range jobs {
-		preview := job.Message.Text()
-		if len(preview) > 40 {
-			preview = preview[:40] + "..."
-		}
-
+	for _, job := range jobs {
 		text += fmt.Sprintf(
-			"<b>#%d</b>\nChats: %d\nInterval: %v\nOwner: <code>%d</code>\nMessage: %s\n\n",
-			i+1,
+			"🆔 #%d\nChats: %d\nInterval: %v\n\n",
+			job.ID,
 			len(job.Chats),
 			job.Interval,
-			job.OwnerID,
-			preview,
 		)
 	}
 
@@ -163,14 +160,13 @@ func cancelHandler(m *telegram.NewMessage) error {
 
 	if len(jobs) == 0 {
 		mu.Unlock()
-		m.Reply("❌ No jobs to cancel", &telegram.SendOptions{})
+		m.Reply("❌ No jobs running", &telegram.SendOptions{})
 		return nil
 	}
 
-	list := "🛑 <b>Select Job Number To Cancel</b>\n\n"
-
-	for i, job := range jobs {
-		list += fmt.Sprintf("#%d → %d chats | %v\n", i+1, len(job.Chats), job.Interval)
+	list := "🛑 <b>Send Job ID To Cancel</b>\n\n"
+	for _, job := range jobs {
+		list += fmt.Sprintf("ID %d → %d chats\n", job.ID, len(job.Chats))
 	}
 
 	mu.Unlock()
@@ -190,28 +186,22 @@ func cancelHandler(m *telegram.NewMessage) error {
 		return err
 	}
 
-	index, err := strconv.Atoi(strings.TrimSpace(resp.Text()))
-	if err != nil || index <= 0 {
-		conv.Respond("Invalid number", &telegram.SendOptions{})
-		return nil
-	}
+	id, _ := strconv.Atoi(strings.TrimSpace(resp.Text()))
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if index > len(jobs) {
-		conv.Respond("Job not found", &telegram.SendOptions{})
-		return nil
+	for i, job := range jobs {
+		if job.ID == id {
+			close(job.StopChan)
+			jobs = append(jobs[:i], jobs[i+1:]...)
+			log.Printf("JOB STOPPED → ID %d", id)
+			conv.Respond("✅ Job cancelled", &telegram.SendOptions{})
+			return nil
+		}
 	}
 
-	job := jobs[index-1]
-
-	close(job.StopChan)
-
-	jobs = append(jobs[:index-1], jobs[index:]...)
-
-	conv.Respond("✅ Job cancelled successfully", &telegram.SendOptions{})
-
+	conv.Respond("Job not found", &telegram.SendOptions{})
 	return nil
 }
 
@@ -226,12 +216,12 @@ func setupHandler(m *telegram.NewMessage) error {
 	}
 	defer conv.Close()
 
-	conv.Respond("🚀 <b>AutoPoster Setup Started</b>", &telegram.SendOptions{ParseMode: "html"})
+	conv.Respond("🚀 Setup started", &telegram.SendOptions{})
 
 	var chatIDs []int64
 
 	for {
-		resp, err := conv.Ask("Send chat IDs separated by comma\nType <b>done</b> when finished", &telegram.SendOptions{ParseMode: "html"})
+		resp, err := conv.Ask("Send chat IDs (comma separated)\nType done when finished", &telegram.SendOptions{})
 		if err != nil {
 			return err
 		}
@@ -246,9 +236,7 @@ func setupHandler(m *telegram.NewMessage) error {
 			break
 		}
 
-		parts := strings.Split(txt, ",")
-
-		for _, p := range parts {
+		for _, p := range strings.Split(txt, ",") {
 			id, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
 			if err == nil {
 				chatIDs = append(chatIDs, id)
@@ -258,7 +246,7 @@ func setupHandler(m *telegram.NewMessage) error {
 		conv.Respond(fmt.Sprintf("Total chats: %d", len(chatIDs)), &telegram.SendOptions{})
 	}
 
-	resp, err := conv.Ask("Enter interval in minutes", &telegram.SendOptions{})
+	resp, err := conv.Ask("Interval in minutes", &telegram.SendOptions{})
 	if err != nil {
 		return err
 	}
@@ -266,12 +254,13 @@ func setupHandler(m *telegram.NewMessage) error {
 	mins, _ := strconv.Atoi(strings.TrimSpace(resp.Text()))
 	interval := time.Duration(mins) * time.Minute
 
-	msgResp, err := conv.Ask("Send the message to autopost", &telegram.SendOptions{})
+	msgResp, err := conv.Ask("Send message", &telegram.SendOptions{})
 	if err != nil {
 		return err
 	}
 
 	job := &Job{
+		ID:       jobID,
 		Chats:    chatIDs,
 		Message:  msgResp,
 		Interval: interval,
@@ -279,23 +268,22 @@ func setupHandler(m *telegram.NewMessage) error {
 		StopChan: make(chan struct{}),
 	}
 
+	jobID++
+
 	mu.Lock()
 	jobs = append(jobs, job)
 	mu.Unlock()
 
+	log.Printf("JOB CREATED → ID %d | Chats %d | Interval %v", job.ID, len(chatIDs), interval)
+
 	go sendLoop(job)
 
-	conv.Respond("✅ Job created successfully", &telegram.SendOptions{})
+	conv.Respond("✅ Job created & started", &telegram.SendOptions{})
 	return nil
 }
 
 func isBannedError(err error) bool {
-	if err == nil {
-		return false
-	}
-
 	msg := strings.ToLower(err.Error())
-
 	return strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "not participant") ||
 		strings.Contains(msg, "kicked") ||
@@ -310,36 +298,56 @@ func removeChat(job *Job, chatID int64) {
 	for i, id := range job.Chats {
 		if id == chatID {
 			job.Chats = append(job.Chats[:i], job.Chats[i+1:]...)
+			log.Printf("CHAT REMOVED → Job %d | Chat %d", job.ID, chatID)
 			return
 		}
 	}
 }
 
 func sendLoop(job *Job) {
+	log.Printf("JOB LOOP STARTED → ID %d", job.ID)
+
+	sendNow(job)
+
 	ticker := time.NewTicker(job.Interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-job.StopChan:
+			log.Printf("JOB LOOP STOPPED → ID %d", job.ID)
 			return
 
 		case <-ticker.C:
-
-			mu.Lock()
-			chats := append([]int64{}, job.Chats...)
-			msg := job.Message
-			mu.Unlock()
-
-			for _, chat := range chats {
-				_, err := client.SendMessage(chat, msg, &telegram.SendOptions{})
-
-				if err != nil && isBannedError(err) {
-					removeChat(job, chat)
-				}
-
-				time.Sleep(2 * time.Second)
-			}
+			sendNow(job)
 		}
 	}
+}
+
+func sendNow(job *Job) {
+	mu.Lock()
+	chats := append([]int64{}, job.Chats...)
+	msg := job.Message
+	mu.Unlock()
+
+	success := 0
+
+	for _, chat := range chats {
+		_, err := client.SendMessage(chat, msg, &telegram.SendOptions{})
+
+		if err != nil {
+			log.Printf("SEND FAILED → Job %d | Chat %d | %v", job.ID, chat, err)
+
+			if isBannedError(err) {
+				removeChat(job, chat)
+			}
+		} else {
+			success++
+			log.Printf("SENT OK → Job %d | Chat %d", job.ID, chat)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	log.Printf("JOB ROUND DONE → ID %d | Success %d | Total %d", job.ID, success, len(chats))
 }
